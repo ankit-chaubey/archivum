@@ -16,6 +16,7 @@ These apply to **every** command:
 | `--log-file <PATH>` | Append all output (no ANSI colour) to a file |
 | `-h, --help` | Show help |
 | `-V, --version` | Show version |
+| `--pubkey <FILE>` | Only accept indexes signed with this public key |
 
 ---
 
@@ -44,6 +45,9 @@ archivum create <SOURCE> <o> [OPTIONS]
 | `--split-files` | int | `0` | Max files per part (0 = unlimited) |
 | `--exclude` | glob | - | Exclude pattern (repeatable) |
 | `--dedup` | flag | off | Skip files with duplicate SHA-256 |
+| `--zstd-threads` | 0-64 | `0` | zstd worker threads (0 = all cores) |
+| `--overwrite` | flag | off | Replace an existing archive in OUTPUT |
+| `--sign` | file | none | Sign the index with this secret key |
 | `--notes` | string | - | Attach a note to the archive header |
 | `--threads` | int | `4` | Checksum thread count |
 | `--dry-run` | flag | off | Simulate without writing |
@@ -95,6 +99,7 @@ archivum restore <INDEX> <TARGET> [OPTIONS]
 | `--filter <GLOB>` | Only restore matching files |
 | `-f, --force` | Overwrite existing files |
 | `--restore-permissions` | Restore Unix `chmod` bits |
+| `--threads <N>` | Parallel workers, one tar part each |
 | `--dry-run` | Show what would be restored |
 
 ---
@@ -109,11 +114,12 @@ archivum verify <INDEX> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `-c, --continue-on-error` | Don't stop on first failure |
+| `-c, --continue-on-error` | Keep scanning after the first problem (exit code is non-zero either way) |
+| `--threads <N>` | Parallel workers, one tar part each |
 | `--json` | Output results as JSON |
 
 Checks performed:
-1. Blake3 seal on `index.arc.json` (tamper detection)
+1. Blake3 seal on `index.arc.json` (detects corruption and accidental edits)
 2. All expected tar parts present on disk
 3. Every file's SHA-256 matches stored value
 
@@ -290,7 +296,7 @@ archivum repair <DIR> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--compression <ALGO>` | Compression of the existing parts |
+| `--compression <ALGO>` | Compression of the existing parts (default `auto`: detected from the files) |
 
 ---
 
@@ -329,3 +335,14 @@ Display the current effective configuration.
 ```
 archivum config
 ```
+
+
+---
+
+## keygen
+
+```
+archivum keygen NAME
+```
+
+Writes `NAME.key` (secret, mode 0600) and `NAME.pub`. An existing key is never overwritten. Sign with `--sign NAME.key` (also on `update` and `merge`); require the signature with the global `--pubkey NAME.pub`.

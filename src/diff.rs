@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use crate::checksum::hash_file;
 use crate::index::ArchivumIndex;
 use crate::output::OutputCtx;
-use crate::scan::{EntryType, scan_directory};
+use crate::scan::{EntryType, scan_directory_with};
 use crate::utils::human;
 
 pub fn diff(
@@ -31,6 +31,7 @@ pub fn diff(
     source: &Path,
     changed_only: bool,
     use_checksum: bool,
+    exclude: &[String],
     out: &OutputCtx,
 ) -> Result<()> {
     let idx = ArchivumIndex::read(index_path)?;
@@ -56,7 +57,11 @@ pub fn diff(
         .map(|e| (e.path.as_path(), e))
         .collect();
 
-    let current = scan_directory(source, &[])?;
+    let scan = scan_directory_with(source, exclude, &[])?;
+    for w in &scan.warnings {
+        out.eprintln(&format!("  {} {}", "warning:".yellow(), w));
+    }
+    let current = scan.entries;
     let current_map: HashMap<&Path, &crate::scan::ScanEntry> = current
         .iter()
         .filter(|e| e.entry_type == EntryType::File)
@@ -72,34 +77,29 @@ pub fn diff(
         if let Some(ae) = archived.get(path) {
             let size_changed = se.size != ae.size;
             let mtime_changed = se.mtime != ae.mtime;
+            let stored = ae.sha256.as_deref().filter(|h| !h.is_empty());
 
-            if size_changed || mtime_changed {
-                let reason = if size_changed {
-                    format!("size {} -> {}", human(ae.size), human(se.size))
-                } else {
-                    "mtime changed".to_string()
-                };
-                modified.push((path.to_path_buf(), reason));
-            } else if use_checksum {
-                let full_path = source.join(path);
-                match hash_file(&full_path) {
-                    Ok(actual_hash) => {
-                        let stored = ae.sha256.as_deref().unwrap_or("");
-                        if !stored.is_empty() && actual_hash != stored {
-                            modified.push((
-                                path.to_path_buf(),
-                                format!(
-                                    "checksum mismatch ({}... vs {}...)",
-                                    &stored[..8],
-                                    &actual_hash[..8]
-                                ),
-                            ));
-                        } else {
-                            unchanged += 1;
-                        }
-                    }
-                    Err(_) => unchanged += 1,
+            if size_changed {
+                modified.push((
+                    path.to_path_buf(),
+                    format!("size {} -> {}", human(ae.size), human(se.size)),
+                ));
+            } else if use_checksum && stored.is_some() {
+                // a touched file with identical content is not a change
+                match hash_file(&source.join(path)) {
+                    Ok(actual) if Some(actual.as_str()) == stored => unchanged += 1,
+                    Ok(actual) => modified.push((
+                        path.to_path_buf(),
+                        format!(
+                            "checksum mismatch ({}... vs {}...)",
+                            stored.and_then(|s| s.get(..8)).unwrap_or(""),
+                            &actual[..8]
+                        ),
+                    )),
+                    Err(e) => modified.push((path.to_path_buf(), format!("unreadable: {e}"))),
                 }
+            } else if mtime_changed {
+                modified.push((path.to_path_buf(), "mtime changed".to_string()));
             } else {
                 unchanged += 1;
             }
@@ -134,6 +134,9 @@ pub fn diff(
         ));
     }
 
+    added.sort();
+    removed.sort();
+    modified.sort();
     for (path, size) in &added {
         out.println(&format!(
             "  {} {} ({})",

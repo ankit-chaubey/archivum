@@ -10,25 +10,27 @@ This document describes the internal structure of the Archivum codebase.
 src/
 ├── main.rs          CLI entry point - clap parsing, command dispatch
 ├── output.rs        OutputCtx - unified quiet/json/dry-run/log routing
-├── config.rs        config.toml loading, setup wizard
+├── config.rs        config.toml loading (missing keys fall back to defaults), setup wizard
+├── fsutil.rs        Atomic writes, output-directory safety, relative paths
 │
-├── scan.rs          Directory traversal (WalkDir), symlink detection, excludes
-├── checksum.rs      Parallel SHA-256 (Rayon) + Blake3 sealing
-├── compress.rs      Compression abstraction: none/gzip/zstd/bzip2/lz4
-├── tar_writer.rs    Two-pass tar writing: size assignment → write
+├── scan.rs          Directory traversal (WalkDir), symlink detection, pruned excludes
+├── checksum.rs      Parallel SHA-256 (Rayon), hashing reader
+├── compress.rs      Per-frame encode and seekable decode: none/gzip/zstd/bzip2/lz4
+├── tar_writer.rs    Frame writer: batching, parallel compression, atomic parts
 │
-├── index.rs         ArchivumIndex v3: build/read/write/print/seal
-├── restore.rs       Grouped restore engine + single-file extract
-├── verify.rs        Part existence + SHA-256 + Blake3 index verification
+├── index.rs         ArchivumIndex v4: parts, frame locations, read/validate/write, Blake3 seal
+├── sign.rs          Ed25519 keys and index signatures
+├── restore.rs       Parallel frame restore, symlink-safe paths, extract/cat helpers
+├── verify.rs        Parts, sizes, per-frame SHA-256, seal and signature
 ├── diff.rs          Archive vs live-source drift detection
 │
 ├── search.rs        Glob + substring search over index entries
 ├── stats.rs         Compression ratio, extension stats, dedup savings
 ├── cat.rs           Stream single file to stdout
 │
-├── update.rs        Incremental archive (new/modified only)
+├── update.rs        Incremental archive (new/modified only, reuses older parts)
 ├── merge.rs         Multi-archive merge into one
-├── prune.rs         Age + count based archive pruning
+├── prune.rs         Age + count based pruning, protects archives others depend on
 ├── repair.rs        Index reconstruction from orphaned tar parts
 │
 ├── completions.rs   Shell completion generation (bash/zsh/fish)
@@ -64,44 +66,40 @@ checksum::seal_index()          ← index.arc.json.b3 (Blake3)
 ### Restore
 
 ```
-index.arc.json → read + verify Blake3 seal
+index.arc.json → read, check Blake3 seal (+ signature with --pubkey), validate paths
       │
       ▼
-Group entries by tar_part        ← O(n) grouping
+Group wanted files by frame (a dedup alias is served from its origin's frame)
       │
       ▼
-For each part (opened once):
-  ├── Decompress stream
-  ├── Iterate tar entries
-  └── Write matching files → target/
+Frames in parallel (one worker each):
+  ├── Decompress just that frame
+  ├── Iterate its tar members
+  └── Write matching files, hashing while writing → compare to sha256
+      │
+      ▼
+Symlinks, then directory permissions/mtime (deepest first)
 ```
 
 ### Verify
 
 ```
-index.arc.json.b3 → check Blake3 seal
+Seal + signature → every referenced part exists and has the recorded size
       │
       ▼
-For each expected part:
-  └── Check file exists on disk
-      │
-      ▼
-For each file entry:
-  └── Recompute SHA-256 from tar → compare to stored value
+Frames in parallel: recompute SHA-256 of every member, report
+corrupt / missing / unlisted members. Exit code is non-zero on any problem.
 ```
 
 ---
 
 ## Key Design Decisions
 
-### Two-Pass Tar Writing
+### Frames, batching and the writer pipeline
 
-Files cannot be assigned to parts and written in one pass because the part assignment depends on cumulative sizes. Instead:
+`tar_writer::ArchiveSink` plans parts on the fly (uncompressed size and file-count limits), batches small files into ~1 MiB frames and hands each batch to a rayon worker for compression. Finished frames are written strictly in plan order, so the output never depends on the thread count. Large files (4 MiB and up) are streamed as their own frame; for zstd these use the multithreaded encoder, whose output is identical for any worker count of 1 or more. Frames below the threshold always use the single-threaded encoder, which keeps the rule independent of the machine.
 
-1. **Pass 1**: Walk all entries, compute cumulative sizes, assign `tar_part` index
-2. **Pass 2**: Open each part file and stream the actual file bytes
-
-This eliminates borrow checker issues and allows clean part boundary logic.
+Parts are written as `*.tmp` and renamed only when everything (data, end-of-archive frame, fsync) succeeded. The index and its seal are written the same way.
 
 ### OutputCtx
 

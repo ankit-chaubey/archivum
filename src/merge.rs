@@ -15,211 +15,281 @@
  * limitations under the License.
  */
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use colored::Colorize;
-use std::collections::HashSet;
-use std::fs;
-use std::io::{self, copy};
+use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+use crate::checksum::HashingReader;
 use crate::compress::CompressionAlgo;
-use crate::index::{ArchivumIndex, INDEX_VERSION, IndexEntry, IndexHeader};
+use crate::fsutil::{INDEX_NAME, ensure_clean_output, same_path};
+use crate::index::{ArchivumIndex, INDEX_VERSION, IndexEntry, IndexHeader, Loc};
 use crate::output::OutputCtx;
 use crate::scan::EntryType;
-use crate::utils::{fmt_time, now};
+use crate::tar_writer::{ArchiveSink, WriteOpts};
+use crate::utils::{fmt_time, human, now};
 
-struct PartWriter {
-    builder: tar::Builder<Box<dyn io::Write>>,
-    current_size: u64,
+pub struct MergeParams<'a> {
+    pub indexes: &'a [PathBuf],
+    pub output_dir: &'a Path,
+    pub split_bytes: u64,
+    pub algo: CompressionAlgo,
+    pub zstd_level: i32,
+    pub zstd_threads: u32,
+    pub workers: usize,
+    pub overwrite: bool,
+    pub sign_key: Option<&'a ed25519_dalek::SigningKey>,
 }
 
-impl PartWriter {
-    fn open(path: &Path, algo: &CompressionAlgo, zstd_level: i32) -> Result<Self> {
-        let f =
-            fs::File::create(path).with_context(|| format!("Cannot create {}", path.display()))?;
-        let writer: Box<dyn io::Write> = algo.wrap_writer(f, zstd_level)?;
-        Ok(Self {
-            builder: tar::Builder::new(writer),
-            current_size: 0,
-        })
-    }
+/// (source archive, frame inside it)
+type FrameKey = (usize, Loc);
 
-    fn finish(mut self) -> Result<()> {
-        self.builder
-            .finish()
-            .context("Failed to finalize tar part")?;
-        Ok(())
-    }
-}
-
-pub fn merge(
-    index_paths: &[PathBuf],
-    output_dir: &Path,
-    split_bytes: u64,
-    algo: &CompressionAlgo,
-    zstd_level: i32,
-    out: &OutputCtx,
-) -> Result<()> {
+/// Merge several archives into one. When the same path appears in more than one
+/// input, the archive with the newest creation time wins (later arguments win ties).
+/// Every source part is read exactly once and streamed, so memory use stays flat.
+pub fn merge(p: MergeParams, out: &OutputCtx) -> Result<()> {
     out.println(&format!(
-        "{} {} archives -> {}",
+        "{} {} archive(s) -> {}",
         "Merging:".cyan().bold(),
-        index_paths.len().to_string().yellow(),
-        output_dir.display().to_string().yellow()
+        p.indexes.len(),
+        p.output_dir.display().to_string().yellow()
     ));
     out.println("");
 
-    if out.dry_run {
-        for p in index_paths {
-            out.dry(&format!("would merge: {}", p.display()));
+    if p.indexes.len() < 2 {
+        bail!("Merge needs at least two indexes");
+    }
+
+    let mut sources: Vec<(PathBuf, ArchivumIndex)> = vec![];
+    for path in p.indexes {
+        let idx = ArchivumIndex::read(path)
+            .with_context(|| format!("Cannot read index: {}", path.display()))?;
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        if same_path(&dir, p.output_dir) {
+            bail!("The output directory must differ from every input archive directory");
         }
-        out.dry(&format!("output: {}", output_dir.display()));
+        sources.push((dir, idx));
+    }
+
+    // path -> (source, entry) of the winning version
+    let mut winner: HashMap<&Path, (usize, usize)> = HashMap::new();
+    for (si, (_, idx)) in sources.iter().enumerate() {
+        for (ei, e) in idx.entries.iter().enumerate() {
+            let older = winner.get(e.path.as_path()).is_some_and(|&(osi, _)| {
+                sources[osi].1.header.created_at_unix > idx.header.created_at_unix
+            });
+            if !older {
+                winner.insert(e.path.as_path(), (si, ei));
+            }
+        }
+    }
+
+    // Plan: which tar members to copy where, and the entries of the merged index.
+    let mut out_entries: Vec<IndexEntry> = vec![];
+    let mut jobs: BTreeMap<FrameKey, HashMap<PathBuf, usize>> = BTreeMap::new();
+    let mut total_bytes = 0u64;
+
+    for (si, (_, idx)) in sources.iter().enumerate() {
+        let map = idx.path_map();
+        let index_of: HashMap<&Path, usize> = idx
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.path.as_path(), i))
+            .collect();
+        // origin path -> first alias that became a real copy
+        let mut materialized: HashMap<PathBuf, PathBuf> = HashMap::new();
+
+        for (ei, e) in idx.entries.iter().enumerate() {
+            if winner[e.path.as_path()] != (si, ei) {
+                continue;
+            }
+            let mut ne = e.clone();
+            ne.loc = None;
+
+            if e.entry_type != EntryType::File {
+                out_entries.push(ne);
+                continue;
+            }
+
+            let origin = idx.origin_of(&map, e);
+            let origin_wins = e.dedup_of.is_some()
+                && index_of
+                    .get(origin.path.as_path())
+                    .is_some_and(|&oi| winner[origin.path.as_path()] == (si, oi));
+
+            if e.dedup_of.is_some() && origin_wins {
+                ne.dedup_of = Some(origin.path.clone());
+                out_entries.push(ne);
+            } else if let Some(first) = materialized
+                .get(&origin.path)
+                .filter(|_| e.dedup_of.is_some())
+            {
+                ne.dedup_of = Some(first.clone());
+                out_entries.push(ne);
+            } else {
+                // this entry carries real data into the merged archive
+                ne.dedup_of = None;
+                ne.sha256 = origin.sha256.clone();
+                ne.size = origin.size;
+                let member = origin.path.clone();
+                if e.dedup_of.is_some() {
+                    materialized.insert(origin.path.clone(), e.path.clone());
+                }
+                total_bytes += ne.size;
+                let loc = origin
+                    .loc
+                    .with_context(|| format!("{} has no data location", origin.path.display()))?;
+                jobs.entry((si, loc))
+                    .or_default()
+                    .insert(member, out_entries.len());
+                out_entries.push(ne);
+            }
+        }
+    }
+
+    let n_files = out_entries
+        .iter()
+        .filter(|e| e.entry_type == EntryType::File)
+        .count();
+    out.println(&format!(
+        "  {} file(s), {} data to copy",
+        n_files.to_string().yellow(),
+        human(total_bytes)
+    ));
+
+    if out.dry_run {
+        out.dry(&format!(
+            "would write merged archive to {}",
+            p.output_dir.display()
+        ));
         return Ok(());
     }
 
-    fs::create_dir_all(output_dir)
-        .with_context(|| format!("Cannot create output dir {}", output_dir.display()))?;
+    ensure_clean_output(p.output_dir, p.overwrite)?;
+    std::fs::create_dir_all(p.output_dir)
+        .with_context(|| format!("Cannot create {}", p.output_dir.display()))?;
 
-    // collect all entries, skip duplicates by path
-    let mut work_list: Vec<(PathBuf, IndexEntry)> = vec![];
-    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
-    let mut total_skipped = 0usize;
+    let pb = ProgressBar::new(total_bytes);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "  {spinner:.cyan} Merging    [{bar:40.cyan/blue}] {bytes}/{total_bytes}  ETA {eta}",
+        )
+        .unwrap()
+        .progress_chars("=> "),
+    );
 
-    for idx_path in index_paths {
-        let idx = ArchivumIndex::read(idx_path)
-            .with_context(|| format!("Cannot read: {}", idx_path.display()))?;
-        let dir = idx_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let mut sink = ArchiveSink::new(&WriteOpts {
+        out_dir: p.output_dir.to_path_buf(),
+        algo: p.algo.clone(),
+        zstd_level: p.zstd_level,
+        zstd_threads: p.zstd_threads,
+        split_bytes: p.split_bytes,
+        split_files: 0,
+        workers: p.workers,
+    })?;
+    let mut tickets: Vec<(usize, usize)> = vec![];
 
-        out.println(&format!(
-            "  Reading {} ({} files)",
-            idx_path.display().to_string().yellow(),
-            idx.header.total_files
-        ));
+    for ((si, loc), mut wants) in jobs {
+        let (dir, idx) = &sources[si];
+        let where_ = idx.part_path(dir, loc.part);
+        let reader = idx.open_frame(dir, loc)?;
+        let mut archive = tar::Archive::new(reader);
 
-        for entry in idx.entries {
-            if entry.entry_type != EntryType::File || entry.dedup_of.is_some() {
+        for item in archive
+            .entries()
+            .with_context(|| format!("Cannot read {}", where_.display()))?
+        {
+            let mut item =
+                item.with_context(|| format!("Damaged archive data in {}", where_.display()))?;
+            let member = item.path()?.into_owned();
+            let Some(oi) = wants.remove(&member) else {
                 continue;
+            };
+            let (dest, size, mode, mtime, expected) = {
+                let ne = &out_entries[oi];
+                (
+                    ne.path.clone(),
+                    ne.size,
+                    ne.unix_mode,
+                    ne.mtime,
+                    ne.sha256.clone(),
+                )
+            };
+            let mut hr = HashingReader::new(&mut item);
+            let ticket = sink.append(&dest, size, mode, mtime, &mut hr)?;
+            let (hash, bytes) = hr.finalize();
+            if bytes != size || expected.is_some_and(|h| h != hash) {
+                bail!(
+                    "{} is corrupt in {} (size/checksum mismatch); merge aborted",
+                    member.display(),
+                    where_.display()
+                );
             }
-            if seen_paths.contains(&entry.path) {
-                total_skipped += 1;
-                continue;
-            }
-            seen_paths.insert(entry.path.clone());
-            work_list.push((dir.clone(), entry));
+            tickets.push((oi, ticket));
+            pb.inc(size);
+        }
+
+        if !wants.is_empty() {
+            let names: Vec<String> = wants
+                .keys()
+                .take(10)
+                .map(|p| p.display().to_string())
+                .collect();
+            bail!(
+                "{} file(s) listed in the index are missing from {}:\n  {}",
+                wants.len(),
+                where_.display(),
+                names.join("\n  ")
+            );
         }
     }
 
-    if total_skipped > 0 {
-        out.println(&format!(
-            "  {} {} duplicate file(s) skipped",
-            "Note:".yellow(),
-            total_skipped
-        ));
+    let committed = sink.commit()?;
+    for (oi, t) in tickets {
+        out_entries[oi].loc = Some(committed.frames[t]);
     }
+    pb.finish_with_message("merge done".green().to_string());
 
-    out.println(&format!(
-        "\n  Merging {} unique files...",
-        work_list.len().to_string().cyan()
-    ));
-
-    let ext = algo.extension();
-    let mut current_part: u32 = 0;
-    let mut new_entries: Vec<IndexEntry> = vec![];
-
-    let first_path = output_dir.join(format!("data.part{:03}{}", current_part, ext));
-    let mut pw = PartWriter::open(&first_path, algo, zstd_level)?;
-
-    for (src_dir, mut entry) in work_list {
-        let src_part_path = src_dir.join(format!(
-            "data.part{:03}{}",
-            entry.tar_part,
-            algo.extension()
-        ));
-
-        let overhead = 512 + entry.size.div_ceil(512) * 512;
-
-        if pw.current_size > 0 && pw.current_size + overhead > split_bytes {
-            pw.finish()?;
-            current_part += 1;
-            let next_path = output_dir.join(format!("data.part{:03}{}", current_part, ext));
-            pw = PartWriter::open(&next_path, algo, zstd_level)?;
-        }
-
-        if let Ok(reader) = algo.wrap_reader(&src_part_path) {
-            let mut src_archive = tar::Archive::new(reader);
-            if let Ok(entries_iter) = src_archive.entries() {
-                for item in entries_iter.flatten() {
-                    let mut item = item;
-                    let matches = item
-                        .path()
-                        .map(|p| p.as_ref() == entry.path.as_path())
-                        .unwrap_or(false);
-                    if matches {
-                        let mut buf: Vec<u8> = Vec::with_capacity(entry.size as usize);
-                        copy(&mut item, &mut buf)?;
-
-                        let mut header = tar::Header::new_gnu();
-                        header.set_path(&entry.path)?;
-                        header.set_size(buf.len() as u64);
-                        header.set_mode(entry.unix_mode.unwrap_or(0o644));
-                        if let Some(mtime) = entry.mtime {
-                            header.set_mtime(mtime);
-                        }
-                        header.set_cksum();
-
-                        pw.builder.append(&header, &mut io::Cursor::new(&buf))?;
-                        pw.current_size += overhead;
-                        break;
-                    }
-                }
-            }
-        }
-
-        entry.tar_part = current_part;
-        entry.tar_base = None;
-        new_entries.push(entry);
-    }
-
-    pw.finish()?;
-
-    let total_parts = current_part + 1;
-    let total_files = new_entries.len() as u64;
-    let total_size: u64 = new_entries.iter().map(|e| e.size).sum();
-
-    out.println(&format!(
-        "  {} {} files in {} parts",
-        "Merged:".green().bold(),
-        total_files.to_string().cyan(),
-        total_parts.to_string().cyan()
-    ));
-
+    out_entries.sort_by(|a, b| a.path.cmp(&b.path));
     let ts = now();
-    let merged_idx = ArchivumIndex {
+    let mut merged = ArchivumIndex {
         header: IndexHeader {
             version: INDEX_VERSION,
             created_at_unix: ts,
             created_at_human: fmt_time(ts),
-            total_files,
+            total_files: 0,
             total_dirs: 0,
             total_symlinks: 0,
-            total_size,
-            total_parts,
-            compression: algo.clone(),
-            zstd_level,
-            notes: format!("Merged from {} archives", index_paths.len()),
-            part_bases: vec![String::new()],
-            _integrity: None,
+            total_size: 0,
+            zstd_level: p.zstd_level,
+            notes: format!("Merged from {} archives", sources.len()),
+            parts: committed.parts,
         },
-        entries: new_entries,
+        entries: out_entries,
     };
+    merged.recount();
+    let index_path = p.output_dir.join(INDEX_NAME);
+    merged.write_signed(&index_path, p.sign_key)?;
+    let (files, dirs, symlinks, total_parts) = (
+        merged.header.total_files,
+        merged.header.total_dirs,
+        merged.header.total_symlinks,
+        merged.header.parts.len(),
+    );
 
-    let index_path = output_dir.join("index.arc.json");
-    merged_idx.write(&index_path)?;
-
+    out.println(&format!(
+        "  Merged: {} files, {} dirs, {} symlinks in {} parts",
+        files, dirs, symlinks, total_parts
+    ));
     out.println(&format!(
         "\n  {} {}",
         "Merged index written to:".green().bold(),
         index_path.display().to_string().yellow()
     ));
-
     Ok(())
 }

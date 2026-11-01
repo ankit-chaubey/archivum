@@ -16,6 +16,9 @@ split_files = 0
 # Checksum thread count
 threads = 8
 
+# zstd worker threads (0 = all cores). Output is identical for any value >= 1.
+zstd_threads = 0
+
 [output]
 # Suppress all stdout output globally
 quiet = false
@@ -56,3 +59,9 @@ keep_last = 5
 
 # Remove archives older than N days (0 = disabled)
 max_age_days = 0
+
+[security]
+# Secret key (from `archivum keygen`) used to sign every index this tool writes.
+sign_key = ""
+# Public key every index must be signed with when reading ("" = no requirement).
+pubkey = ""

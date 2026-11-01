@@ -15,207 +15,286 @@
  * limitations under the License.
  */
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use colored::Colorize;
-
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::checksum::{compute_checksums, hash_file};
 use crate::compress::CompressionAlgo;
-use crate::index::{ArchivumIndex, INDEX_VERSION, IndexEntry, IndexHeader};
+use crate::fsutil::{INDEX_NAME, ensure_clean_output, relative_path, same_path};
+use crate::index::{ArchivumIndex, INDEX_VERSION, IndexEntry, IndexHeader, PartRef};
 use crate::output::OutputCtx;
-use crate::scan::{EntryType, scan_directory};
-use crate::tar_writer::write_archive;
+use crate::scan::{EntryType, ScanEntry, scan_directory_with};
+use crate::tar_writer::{WriteOpts, write_archive};
 use crate::utils::{fmt_time, human, now};
 
-#[allow(clippy::too_many_arguments)]
-pub fn update(
-    old_index_path: &Path,
-    source: &Path,
-    output_dir: &Path,
-    split_bytes: u64,
-    split_files: usize,
-    algo: &CompressionAlgo,
-    zstd_level: i32,
-    threads: usize,
-    exclude: &[String],
-    use_checksum: bool,
-    out: &OutputCtx,
-) -> Result<()> {
+pub struct UpdateParams<'a> {
+    pub old_index_path: &'a Path,
+    pub source: &'a Path,
+    pub output_dir: &'a Path,
+    pub split_bytes: u64,
+    pub split_files: usize,
+    /// `None` uses the compression of the newest part of the old archive. It may differ
+    /// from the old parts: every part records its own compression.
+    pub algo: Option<CompressionAlgo>,
+    pub sign_key: Option<&'a ed25519_dalek::SigningKey>,
+    pub zstd_level: i32,
+    pub zstd_threads: u32,
+    pub threads: usize,
+    pub exclude: &'a [String],
+    pub use_checksum: bool,
+    pub dedup: bool,
+}
+
+pub fn update(p: UpdateParams, out: &OutputCtx) -> Result<()> {
     out.println(&format!(
         "{} {} -> {}",
         "Incremental update:".cyan().bold(),
-        source.display().to_string().yellow(),
-        output_dir.display().to_string().yellow()
+        p.source.display().to_string().yellow(),
+        p.output_dir.display().to_string().yellow()
     ));
     out.println("");
 
-    let old_idx = ArchivumIndex::read(old_index_path)
-        .with_context(|| format!("Cannot read old index: {}", old_index_path.display()))?;
-    let old_index_dir = old_index_path.parent().unwrap_or(Path::new("."));
+    let old_idx = ArchivumIndex::read(p.old_index_path)
+        .with_context(|| format!("Cannot read old index: {}", p.old_index_path.display()))?;
+    let old_index_dir = match p.old_index_path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
 
-    let old_map: HashMap<&Path, &IndexEntry> = old_idx
+    let algo = p.algo.clone().unwrap_or_else(|| {
+        old_idx
+            .header
+            .parts
+            .first()
+            .map(|x| x.compression.clone())
+            .unwrap_or_default()
+    });
+
+    if same_path(p.output_dir, old_index_dir) {
+        bail!("The output directory must differ from the directory of the old archive");
+    }
+    if same_path(p.output_dir, p.source) {
+        bail!("The output directory must differ from the source directory");
+    }
+    ensure_clean_output(p.output_dir, false)?;
+    if !out.dry_run {
+        std::fs::create_dir_all(p.output_dir)
+            .with_context(|| format!("Cannot create output dir {}", p.output_dir.display()))?;
+    }
+    let skip: Vec<PathBuf> = p.output_dir.canonicalize().into_iter().collect();
+
+    let scan = scan_directory_with(p.source, p.exclude, &skip)
+        .with_context(|| format!("Failed to scan {}", p.source.display()))?;
+    for w in &scan.warnings {
+        out.eprintln(&format!("  {} {}", "warning:".yellow(), w));
+    }
+
+    let old_files: HashMap<&Path, &IndexEntry> = old_idx
         .entries
         .iter()
         .filter(|e| e.entry_type == EntryType::File)
         .map(|e| (e.path.as_path(), e))
         .collect();
 
-    let scan = scan_directory(source, exclude)
-        .with_context(|| format!("Failed to scan {}", source.display()))?;
-
     let mut unchanged: Vec<IndexEntry> = vec![];
-    let mut changed_paths: Vec<PathBuf> = vec![];
-    let mut new_paths: Vec<PathBuf> = vec![];
+    let mut rearchive: HashSet<PathBuf> = HashSet::new();
+    let (mut n_changed, mut n_new) = (0usize, 0usize);
+    let mut seen_old: HashSet<&Path> = HashSet::new();
 
-    for se in &scan {
-        if se.entry_type != EntryType::File {
-            continue;
-        }
-        if let Some(old_entry) = old_map.get(se.relative_path.as_path()) {
-            let size_match = se.size == old_entry.size;
-            let mtime_match = se.mtime == old_entry.mtime;
-
-            let is_unchanged = if use_checksum && old_entry.sha256.is_some() {
-                if size_match && mtime_match {
-                    // size+mtime match: assume unchanged, skip the expensive hash
+    for se in scan
+        .entries
+        .iter()
+        .filter(|e| e.entry_type == EntryType::File)
+    {
+        match old_files.get(se.relative_path.as_path()) {
+            Some(old) => {
+                seen_old.insert(old.path.as_path());
+                let size_match = se.size == old.size;
+                let same = if size_match && se.mtime == old.mtime {
                     true
+                } else if p.use_checksum && size_match && old.sha256.is_some() {
+                    hash_file(&p.source.join(&se.relative_path))
+                        .map(|h| Some(h.as_str()) == old.sha256.as_deref())
+                        .unwrap_or(false)
                 } else {
-                    let actual = hash_file(&source.join(&se.relative_path)).unwrap_or_default();
-                    actual == old_entry.sha256.as_deref().unwrap_or("")
+                    false
+                };
+                if same {
+                    // content is unchanged: keep the data reference, refresh metadata
+                    let mut e = (*old).clone();
+                    e.mtime = se.mtime;
+                    e.unix_mode = se.unix_mode;
+                    unchanged.push(e);
+                } else {
+                    rearchive.insert(se.relative_path.clone());
+                    n_changed += 1;
                 }
-            } else {
-                size_match && mtime_match
-            };
-
-            if is_unchanged {
-                unchanged.push((*old_entry).clone());
-            } else {
-                changed_paths.push(se.relative_path.clone());
             }
-        } else {
-            new_paths.push(se.relative_path.clone());
+            None => {
+                rearchive.insert(se.relative_path.clone());
+                n_new += 1;
+            }
         }
     }
+    let deleted = old_files.len() - seen_old.len();
+
+    // A dedup alias is only valid while the file it points to still holds the same
+    // content. If that origin changed or disappeared, the alias must carry its own data.
+    let old_map = old_idx.path_map();
+    let kept: HashSet<PathBuf> = unchanged.iter().map(|e| e.path.clone()).collect();
+    let mut demoted = 0usize;
+    unchanged.retain_mut(|e| {
+        if e.dedup_of.is_none() {
+            return true;
+        }
+        let origin = old_map
+            .get(e.path.as_path())
+            .map(|o| old_idx.origin_of(&old_map, o));
+        match origin {
+            Some(o) if o.dedup_of.is_none() && kept.contains(&o.path) => {
+                e.dedup_of = Some(o.path.clone());
+                true
+            }
+            _ => {
+                rearchive.insert(e.path.clone());
+                demoted += 1;
+                false
+            }
+        }
+    });
 
     out.println(&format!(
-        "  Unchanged: {}  Changed: {}  New: {}  (source total: {} files)",
+        "  Unchanged: {}   Changed: {}   New: {}   Deleted: {}",
         unchanged.len().to_string().green(),
-        changed_paths.len().to_string().yellow(),
-        new_paths.len().to_string().cyan(),
-        scan.iter()
-            .filter(|e| e.entry_type == EntryType::File)
-            .count()
+        n_changed.to_string().yellow(),
+        n_new.to_string().cyan(),
+        deleted.to_string().red()
     ));
-    out.println("");
+    if demoted > 0 {
+        out.println(&format!(
+            "  {} duplicate file(s) lost their dedup origin and will be stored again",
+            demoted
+        ));
+    }
+
+    let delta_scan: Vec<ScanEntry> = scan
+        .entries
+        .iter()
+        .filter(|e| e.entry_type == EntryType::File && rearchive.contains(&e.relative_path))
+        .cloned()
+        .collect();
+    let delta_size: u64 = delta_scan.iter().map(|e| e.size).sum();
 
     if out.dry_run {
-        for p in &changed_paths {
-            out.dry(&format!("would re-archive: {}", p.display()));
-        }
-        for p in &new_paths {
-            out.dry(&format!("would archive new: {}", p.display()));
-        }
+        out.dry(&format!(
+            "would re-archive {} file(s) ({})",
+            delta_scan.len(),
+            human(delta_size)
+        ));
         return Ok(());
     }
 
-    std::fs::create_dir_all(output_dir)
-        .with_context(|| format!("Cannot create output dir {}", output_dir.display()))?;
-
-    let need_rearchive: std::collections::HashSet<&Path> = changed_paths
+    // the old parts that unchanged files still need must exist
+    let mut missing_parts = BTreeSet::new();
+    for loc in unchanged
         .iter()
-        .chain(new_paths.iter())
-        .map(|p| p.as_path())
-        .collect();
-
-    let delta_scan: Vec<_> = scan
-        .into_iter()
-        .filter(|e| need_rearchive.contains(e.relative_path.as_path()))
-        .collect();
-
-    let delta_size: u64 = delta_scan
-        .iter()
-        .filter(|e| e.entry_type == EntryType::File)
-        .map(|e| e.size)
-        .sum();
+        .filter(|e| e.dedup_of.is_none())
+        .filter_map(|e| e.loc)
+    {
+        let part = old_idx.part_path(old_index_dir, loc.part);
+        if !part.exists() {
+            missing_parts.insert(part);
+        }
+    }
+    if !missing_parts.is_empty() {
+        bail!(
+            "Parts of the old archive are missing, the update would be unusable:\n  {}",
+            missing_parts
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        );
+    }
 
     out.println(&format!(
         "  Re-archiving {} file(s) ({})",
-        (changed_paths.len() + new_paths.len()).to_string().yellow(),
+        delta_scan.len().to_string().yellow(),
         human(delta_size)
     ));
 
-    let mut delta_idx = ArchivumIndex::build(delta_scan, algo.clone(), zstd_level);
-    compute_checksums(source, &mut delta_idx, threads)?;
-
+    let mut delta_idx = ArchivumIndex::build(delta_scan, p.zstd_level);
+    compute_checksums(p.source, &mut delta_idx, p.threads, p.dedup)?;
     write_archive(
-        source,
-        output_dir,
+        p.source,
         &mut delta_idx,
-        split_bytes,
-        split_files,
-        algo,
-        zstd_level,
+        &WriteOpts {
+            out_dir: p.output_dir.to_path_buf(),
+            algo: algo.clone(),
+            zstd_level: p.zstd_level,
+            zstd_threads: p.zstd_threads,
+            split_bytes: p.split_bytes,
+            split_files: p.split_files,
+            workers: p.threads,
+        },
     )?;
 
-    // part_bases[0] = output_dir (new parts), part_bases[1] = old dir (old parts)
-    let old_rel = relative_path(output_dir, old_index_dir);
+    // New parts first, then every part of the old archive, re-expressed relative to
+    // the new directory so chains of updates keep resolving correctly.
+    let new_parts = delta_idx.header.parts.len() as u32;
+    let mut parts: Vec<PartRef> = delta_idx.header.parts.clone();
+    for old in &old_idx.header.parts {
+        let abs = old_index_dir.join(&old.path);
+        parts.push(PartRef {
+            path: relative_path(p.output_dir, &abs)
+                .to_string_lossy()
+                .replace('\\', "/"),
+            compression: old.compression.clone(),
+            size: old.size,
+        });
+    }
 
     let mut all_entries: Vec<IndexEntry> = vec![];
-
     for mut e in unchanged {
-        e.tar_base = Some(1);
+        if let Some(l) = e.loc.as_mut() {
+            l.part += new_parts;
+        }
         all_entries.push(e);
     }
+    all_entries.extend(delta_idx.entries);
 
-    for e in delta_idx.entries {
-        all_entries.push(e);
-    }
-
-    for e in &old_idx.entries {
-        if e.entry_type != EntryType::File {
-            all_entries.push(e.clone());
-        }
-    }
-
-    let mut total_files = 0u64;
-    let mut total_dirs = 0u64;
-    let mut total_symlinks = 0u64;
-    let mut total_size = 0u64;
-    for e in &all_entries {
-        match e.entry_type {
-            EntryType::File => {
-                total_files += 1;
-                total_size += e.size;
-            }
-            EntryType::Directory => total_dirs += 1,
-            EntryType::Symlink => total_symlinks += 1,
-        }
-    }
+    // directories and symlinks always come from the fresh scan
+    let others: Vec<ScanEntry> = scan
+        .entries
+        .iter()
+        .filter(|e| e.entry_type != EntryType::File)
+        .cloned()
+        .collect();
+    all_entries.extend(ArchivumIndex::build(others, p.zstd_level).entries);
+    all_entries.sort_by(|a, b| a.path.cmp(&b.path));
 
     let ts = now();
-    let new_idx = ArchivumIndex {
+    let mut new_idx = ArchivumIndex {
         header: IndexHeader {
             version: INDEX_VERSION,
             created_at_unix: ts,
             created_at_human: fmt_time(ts),
-            total_files,
-            total_dirs,
-            total_symlinks,
-            total_size,
-            total_parts: delta_idx.header.total_parts,
-            compression: algo.clone(),
-            zstd_level,
-            notes: format!("Incremental update from {}", old_index_path.display()),
-            part_bases: vec![String::new(), old_rel.to_string_lossy().into_owned()],
-            _integrity: None,
+            total_files: 0,
+            total_dirs: 0,
+            total_symlinks: 0,
+            total_size: 0,
+            zstd_level: p.zstd_level,
+            notes: format!("Incremental update from {}", p.old_index_path.display()),
+            parts,
         },
         entries: all_entries,
     };
+    new_idx.recount();
 
-    let new_index_path = output_dir.join("index.arc.json");
-    new_idx.write(&new_index_path)?;
+    let new_index_path = p.output_dir.join(INDEX_NAME);
+    new_idx.write_signed(&new_index_path, p.sign_key)?;
 
     out.println("");
     out.println(&format!(
@@ -224,40 +303,9 @@ pub fn update(
         new_index_path.display().to_string().yellow()
     ));
     out.println(&format!(
-        "  Old parts referenced from: {}",
+        "  Older parts referenced from: {}",
         old_index_dir.display().to_string().dimmed()
     ));
 
     Ok(())
-}
-
-fn relative_path(base: &Path, target: &Path) -> PathBuf {
-    let base_abs = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-    let target_abs = target
-        .canonicalize()
-        .unwrap_or_else(|_| target.to_path_buf());
-
-    let base_comps: Vec<_> = base_abs.components().collect();
-    let target_comps: Vec<_> = target_abs.components().collect();
-
-    let common = base_comps
-        .iter()
-        .zip(target_comps.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-
-    let ups = base_comps.len() - common;
-    let mut rel = PathBuf::new();
-    for _ in 0..ups {
-        rel.push("..");
-    }
-    for comp in &target_comps[common..] {
-        rel.push(comp);
-    }
-
-    if rel.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        rel
-    }
 }

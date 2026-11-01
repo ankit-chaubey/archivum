@@ -15,19 +15,43 @@
  * limitations under the License.
  */
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::Colorize;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 
 use crate::compress::CompressionAlgo;
+use crate::fsutil;
 use crate::output::OutputCtx;
 use crate::scan::{EntryType, ScanEntry};
+use crate::sign::{self, SigStatus};
 use crate::utils::{fmt_time, human, now};
 
-pub const INDEX_VERSION: u32 = 3;
+/// v4: every part carries its own path and compression; every file points at the
+/// frame (`part`, `off`, `len`) that holds it.
+pub const INDEX_VERSION: u32 = 4;
+
+/// One tar part on disk. `path` is relative to the directory of the index file and
+/// may point into another directory (incremental archives reuse older parts).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartRef {
+    pub path: String,
+    pub compression: CompressionAlgo,
+    /// compressed size in bytes, used to spot truncated parts without reading them
+    pub size: u64,
+}
+
+/// Location of the compressed frame holding a file. `len == 0` means the frame
+/// boundaries are unknown (index rebuilt by `repair`): decode the whole part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Loc {
+    pub part: u32,
+    pub off: u64,
+    pub len: u64,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IndexHeader {
@@ -38,24 +62,15 @@ pub struct IndexHeader {
     pub total_dirs: u64,
     pub total_symlinks: u64,
     pub total_size: u64,
-    pub total_parts: u32,
-    pub compression: CompressionAlgo,
     #[serde(default = "default_zstd_level")]
     pub zstd_level: i32,
     #[serde(default)]
     pub notes: String,
-    /// index 0 = same dir as index file; used by incremental update
-    #[serde(default = "default_part_bases")]
-    pub part_bases: Vec<String>,
-    #[serde(skip)]
-    pub _integrity: Option<String>,
+    pub parts: Vec<PartRef>,
 }
 
 fn default_zstd_level() -> i32 {
     3
-}
-fn default_part_bases() -> Vec<String> {
-    vec![String::new()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,36 +80,24 @@ pub struct IndexEntry {
     pub size: u64,
     pub mtime: Option<u64>,
     pub unix_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
-    pub tar_part: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<PathBuf>,
-    /// which part_bases index this part lives under (None = 0)
-    #[serde(default)]
-    pub tar_base: Option<u32>,
-    /// if set, this file is a dedup alias and not stored in tar
-    #[serde(default)]
+    /// if set, this file is a dedup alias and not stored in any part
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedup_of: Option<PathBuf>,
+    /// where the data lives (regular files that are not aliases)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loc: Option<Loc>,
 }
 
-impl IndexEntry {
-    pub fn part_path(&self, index_dir: &Path, header: &IndexHeader) -> PathBuf {
-        let base_idx = self.tar_base.unwrap_or(0) as usize;
-        let base = header
-            .part_bases
-            .get(base_idx)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        let dir = if base.is_empty() {
-            index_dir.to_path_buf()
-        } else {
-            index_dir.join(base)
-        };
-        dir.join(format!(
-            "data.part{:03}{}",
-            self.tar_part,
-            header.compression.extension()
-        ))
-    }
+/// How much to trust the `.b3` companion file.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SealStatus {
+    Valid,
+    Missing,
+    Invalid,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -104,7 +107,7 @@ pub struct ArchivumIndex {
 }
 
 impl ArchivumIndex {
-    pub fn build(scan: Vec<ScanEntry>, compression: CompressionAlgo, zstd_level: i32) -> Self {
+    pub fn build(scan: Vec<ScanEntry>, zstd_level: i32) -> Self {
         let mut files = 0u64;
         let mut dirs = 0u64;
         let mut symlinks = 0u64;
@@ -128,10 +131,9 @@ impl ArchivumIndex {
                     mtime: e.mtime,
                     unix_mode: e.unix_mode,
                     sha256: None,
-                    tar_part: 0,
                     symlink_target: e.symlink_target,
-                    tar_base: None,
                     dedup_of: None,
+                    loc: None,
                 }
             })
             .collect();
@@ -146,33 +148,140 @@ impl ArchivumIndex {
                 total_dirs: dirs,
                 total_symlinks: symlinks,
                 total_size: size,
-                total_parts: 0,
-                compression,
                 zstd_level,
                 notes: String::new(),
-                part_bases: vec![String::new()],
-                _integrity: None,
+                parts: vec![],
             },
             entries,
         }
     }
 
+    /// Recompute the totals in the header from the entries.
+    pub fn recount(&mut self) {
+        let (mut f, mut d, mut l, mut s) = (0u64, 0u64, 0u64, 0u64);
+        for e in &self.entries {
+            match e.entry_type {
+                EntryType::File => {
+                    f += 1;
+                    s += e.size;
+                }
+                EntryType::Directory => d += 1,
+                EntryType::Symlink => l += 1,
+            }
+        }
+        self.header.total_files = f;
+        self.header.total_dirs = d;
+        self.header.total_symlinks = l;
+        self.header.total_size = s;
+    }
+
+    pub fn compression_summary(&self) -> String {
+        let mut names: Vec<&str> = vec![];
+        for p in &self.header.parts {
+            let n = p.compression.name();
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+        if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join("+")
+        }
+    }
+
+    pub fn part_path(&self, index_dir: &Path, part: u32) -> PathBuf {
+        let rel = self
+            .header
+            .parts
+            .get(part as usize)
+            .map(|p| p.path.as_str())
+            .unwrap_or("");
+        index_dir.join(rel)
+    }
+
+    /// Decoded tar stream of one frame.
+    pub fn open_frame(&self, index_dir: &Path, loc: Loc) -> Result<Box<dyn Read>> {
+        let part = self
+            .header
+            .parts
+            .get(loc.part as usize)
+            .with_context(|| format!("part {} does not exist", loc.part))?;
+        part.compression
+            .open_stream(&index_dir.join(&part.path), loc.off, loc.len)
+    }
+
     pub fn write(&self, path: &Path) -> Result<()> {
+        self.write_signed(path, None)
+    }
+
+    pub fn write_signed(&self, path: &Path, key: Option<&ed25519_dalek::SigningKey>) -> Result<()> {
         let json = serde_json::to_vec_pretty(self)?;
-        std::fs::write(path, &json)?;
+        fsutil::write_atomic(path, &json)?;
 
-        // companion .b3 integrity file
+        // companion .b3 file: catches corruption and accidental edits
+        // (an unkeyed hash; use --sign for protection against a deliberate attacker)
         let hash = blake3::hash(&json);
-        let b3_path = path.with_extension("json.b3");
-        std::fs::write(&b3_path, hash.to_hex().as_str())?;
+        fsutil::write_atomic(&Self::seal_path(path), hash.to_hex().as_bytes())?;
 
+        let sig_path = Self::sig_path(path);
+        match key {
+            Some(k) => fsutil::write_atomic(&sig_path, sign::sign(k, &json).as_bytes())?,
+            // never leave a signature of an older index next to a new one
+            None => {
+                let _ = std::fs::remove_file(&sig_path);
+            }
+        }
         Ok(())
+    }
+
+    fn seal_path(path: &Path) -> PathBuf {
+        Self::sibling(path, ".b3")
+    }
+
+    fn sig_path(path: &Path) -> PathBuf {
+        Self::sibling(path, ".sig")
+    }
+
+    fn sibling(path: &Path, suffix: &str) -> PathBuf {
+        let mut s = path.as_os_str().to_owned();
+        s.push(suffix);
+        PathBuf::from(s)
+    }
+
+    pub fn seal_status(path: &Path) -> Result<SealStatus> {
+        let seal = Self::seal_path(path);
+        if !seal.exists() {
+            return Ok(SealStatus::Missing);
+        }
+        let bytes = std::fs::read(path)?;
+        let stored = std::fs::read_to_string(&seal)?;
+        Ok(if blake3::hash(&bytes).to_hex().as_str() == stored.trim() {
+            SealStatus::Valid
+        } else {
+            SealStatus::Invalid
+        })
+    }
+
+    /// Signature state of the index next to `path`, judged against the key given
+    /// with `--pubkey` (if any).
+    pub fn signature_status(path: &Path) -> Result<SigStatus> {
+        let sig = Self::sig_path(path);
+        if !sig.exists() {
+            return Ok(SigStatus::Absent);
+        }
+        let bytes = std::fs::read(path)?;
+        Ok(sign::check(
+            &std::fs::read_to_string(sig)?,
+            &bytes,
+            sign::trusted(),
+        ))
     }
 
     pub fn read(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)?;
 
-        let b3_path = path.with_extension("json.b3");
+        let b3_path = Self::seal_path(path);
         if b3_path.exists() {
             let stored_hex = std::fs::read_to_string(&b3_path)?;
             let stored_hex = stored_hex.trim();
@@ -180,7 +289,7 @@ impl ArchivumIndex {
             if actual.to_hex().as_str() != stored_hex {
                 anyhow::bail!(
                     "Index integrity check FAILED for {}.\n  \
-                     The index may have been tampered with or corrupted.\n  \
+                     The index may have been modified or corrupted.\n  \
                      Expected: {}\n  Got:      {}",
                     path.display(),
                     stored_hex,
@@ -189,9 +298,96 @@ impl ArchivumIndex {
             }
         }
 
-        let r = BufReader::new(std::io::Cursor::new(bytes));
-        let idx: Self = serde_json::from_reader(r)?;
+        if sign::trusted().is_some() {
+            match Self::signature_status(path)? {
+                SigStatus::Valid { trusted: true, .. } => {}
+                SigStatus::Valid { signer, .. } => anyhow::bail!(
+                    "{} is signed by {}, which is not the key given with --pubkey",
+                    path.display(),
+                    signer
+                ),
+                SigStatus::Absent => anyhow::bail!(
+                    "{} has no signature, but --pubkey requires one",
+                    path.display()
+                ),
+                SigStatus::Invalid(why) => {
+                    anyhow::bail!("Signature check FAILED for {}: {}", path.display(), why)
+                }
+            }
+        }
+
+        let idx: Self = serde_json::from_slice(&bytes)?;
+        idx.validate()?;
         Ok(idx)
+    }
+
+    /// Reject indexes we cannot safely interpret (other format, unsafe paths,
+    /// dangling dedup references, bad part references).
+    fn validate(&self) -> Result<()> {
+        if self.header.version != INDEX_VERSION {
+            anyhow::bail!(
+                "Index format v{} is not supported by this build (needs v{}). \
+                 Archives written by older versions must be restored with that version.",
+                self.header.version,
+                INDEX_VERSION
+            );
+        }
+        for p in &self.header.parts {
+            if p.path.is_empty() || Path::new(&p.path).is_absolute() {
+                anyhow::bail!("Invalid part path in index: '{}'", p.path);
+            }
+        }
+
+        let map = self.path_map();
+        for e in &self.entries {
+            if !is_safe_relative(&e.path) {
+                anyhow::bail!("Unsafe path in index: {}", e.path.display());
+            }
+            if e.entry_type != EntryType::File {
+                continue;
+            }
+            match (&e.dedup_of, &e.loc) {
+                (Some(o), _) => match map.get(o.as_path()) {
+                    Some(t) if t.entry_type == EntryType::File && t.path != e.path => {}
+                    _ => anyhow::bail!(
+                        "Entry {} is a dedup alias of {} which is not a file in this index",
+                        e.path.display(),
+                        o.display()
+                    ),
+                },
+                (None, Some(l)) => {
+                    if l.part as usize >= self.header.parts.len() {
+                        anyhow::bail!(
+                            "Entry {} refers to part {} which does not exist",
+                            e.path.display(),
+                            l.part
+                        );
+                    }
+                }
+                (None, None) => anyhow::bail!("Entry {} has no data location", e.path.display()),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn path_map(&self) -> HashMap<&Path, &IndexEntry> {
+        self.entries.iter().map(|e| (e.path.as_path(), e)).collect()
+    }
+
+    /// The entry that physically holds the data for `entry` (follows dedup aliases).
+    pub fn origin_of<'a>(
+        &'a self,
+        map: &HashMap<&Path, &'a IndexEntry>,
+        entry: &'a IndexEntry,
+    ) -> &'a IndexEntry {
+        let mut cur = entry;
+        for _ in 0..16 {
+            match cur.dedup_of.as_deref().and_then(|p| map.get(p)) {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+        cur
     }
 
     pub fn print_summary(
@@ -227,10 +423,16 @@ impl ArchivumIndex {
         out.println(&format!("  Total size: {}", human(h.total_size).cyan()));
         out.println(&format!(
             "  Parts     : {}",
-            h.total_parts.to_string().cyan()
+            h.parts.len().to_string().cyan()
         ));
-        out.println(&format!("  Compress  : {}", h.compression.name().green()));
-        if h.compression == CompressionAlgo::Zstd {
+        out.println(&format!(
+            "  Compress  : {}",
+            self.compression_summary().green()
+        ));
+        if h.parts
+            .iter()
+            .any(|p| p.compression == CompressionAlgo::Zstd)
+        {
             out.println(&format!(
                 "  Zstd lvl  : {}",
                 h.zstd_level.to_string().green()
@@ -282,7 +484,9 @@ impl ArchivumIndex {
                 };
                 out.println(&format!(
                     "  {:<8} {:<12} {:<10} {}{}",
-                    format!("part{:03}", e.tar_part),
+                    e.loc
+                        .map(|l| format!("part{:03}", l.part))
+                        .unwrap_or_else(|| "-".into()),
                     human(e.size),
                     type_str,
                     e.path.display(),
@@ -299,4 +503,11 @@ impl ArchivumIndex {
         println!("{}", serde_json::to_string_pretty(self)?);
         Ok(())
     }
+}
+
+/// Relative path made only of normal components (no `..`, no root, no drive prefix).
+pub fn is_safe_relative(p: &Path) -> bool {
+    !p.as_os_str().is_empty()
+        && p.components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }

@@ -15,51 +15,28 @@
  * limitations under the License.
  */
 
-use anyhow::{Context, Result};
-use std::io::{self, copy};
+use anyhow::Result;
+use std::io::{self, ErrorKind};
 use std::path::Path;
 
+use crate::checksum::HashingReader;
 use crate::index::ArchivumIndex;
-use crate::scan::EntryType;
+use crate::restore::{check_stream, with_member};
 
 pub fn cat(index_path: &Path, file: &Path) -> Result<()> {
     let idx = ArchivumIndex::read(index_path)?;
     let index_dir = index_path.parent().unwrap_or(Path::new("."));
 
-    let entry = idx
-        .entries
-        .iter()
-        .find(|e| e.path == file)
-        .with_context(|| format!("File not found in archive: {}", file.display()))?;
-
-    if entry.entry_type != EntryType::File {
-        anyhow::bail!("Entry is not a regular file: {}", file.display());
-    }
-
-    // deduped files live under the original path
-    let (target_path, target_entry) = if let Some(ref orig) = entry.dedup_of {
-        let orig_entry = idx
-            .entries
-            .iter()
-            .find(|e| &e.path == orig)
-            .with_context(|| format!("Dedup origin not found: {}", orig.display()))?;
-        (orig.as_path(), orig_entry)
-    } else {
-        (file, entry)
-    };
-
-    let part_path = target_entry.part_path(index_dir, &idx.header);
-    let reader = idx.header.compression.wrap_reader(&part_path)?;
-    let mut archive = tar::Archive::new(reader);
-
-    let mut stdout = io::stdout();
-    for item in archive.entries()? {
-        let mut item = item?;
-        if item.path()? == target_path {
-            copy(&mut item, &mut stdout)?;
-            return Ok(());
+    with_member(&idx, index_dir, file, |reader, origin| {
+        let mut stdout = io::stdout().lock();
+        let mut hr = HashingReader::new(reader);
+        match io::copy(&mut hr, &mut stdout) {
+            Ok(_) => {}
+            // `archivum cat ... | head` closes the pipe early; that is not an error
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => return Ok(()),
+            Err(e) => return Err(e.into()),
         }
-    }
-
-    anyhow::bail!("File not found inside tar: {}", file.display());
+        let (hash, bytes) = hr.finalize();
+        check_stream(origin, &hash, bytes)
+    })
 }

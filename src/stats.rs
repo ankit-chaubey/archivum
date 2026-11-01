@@ -29,7 +29,6 @@ pub fn stats(index_path: &Path, out: &OutputCtx) -> Result<()> {
     let idx = ArchivumIndex::read(index_path)?;
     let h = &idx.header;
     let index_dir = index_path.parent().unwrap_or(Path::new("."));
-    let ext = h.compression.extension();
 
     // count files per extension
     let mut ext_map: HashMap<String, (u64, u64)> = HashMap::new();
@@ -51,12 +50,15 @@ pub fn stats(index_path: &Path, out: &OutputCtx) -> Result<()> {
         ext_map.into_iter().map(|(k, (c, b))| (k, c, b)).collect();
     ext_vec.sort_by_key(|b| std::cmp::Reverse(b.2));
 
-    // actual on-disk sizes
+    // actual on-disk sizes of every part this archive reads (older parts included)
     let mut part_sizes: Vec<(u32, u64)> = vec![];
     let mut total_on_disk: u64 = 0;
-    for part in 0..h.total_parts {
-        let path = index_dir.join(format!("data.part{:03}{}", part, ext));
-        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+    for part in 0..h.parts.len() as u32 {
+        let size = idx
+            .part_path(index_dir, part)
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
         total_on_disk += size;
         part_sizes.push((part, size));
     }
@@ -89,8 +91,8 @@ pub fn stats(index_path: &Path, out: &OutputCtx) -> Result<()> {
                 "total_symlinks": h.total_symlinks,
                 "total_size_bytes": h.total_size,
                 "total_size_human": human(h.total_size),
-                "total_parts": h.total_parts,
-                "compression": h.compression.name(),
+                "total_parts": h.parts.len(),
+                "compression": idx.compression_summary(),
             },
             "on_disk_bytes": total_on_disk,
             "on_disk_human": human(total_on_disk),
@@ -123,6 +125,10 @@ pub fn stats(index_path: &Path, out: &OutputCtx) -> Result<()> {
         h.total_symlinks.to_string().cyan()
     ));
     out.println(&format!("  Source size: {}", human(h.total_size).cyan()));
+    out.println(&format!(
+        "  Compress   : {}",
+        idx.compression_summary().green()
+    ));
     out.println(&format!("  On-disk    : {}", human(total_on_disk).cyan()));
     out.println(&format!(
         "  Ratio      : {:.2}x  (saving: {:.1}%)",
@@ -140,10 +146,10 @@ pub fn stats(index_path: &Path, out: &OutputCtx) -> Result<()> {
     out.println(&format!(
         "  {} ({} parts)",
         "Part sizes:".cyan().bold(),
-        h.total_parts
+        h.parts.len()
     ));
     for (part, size) in &part_sizes {
-        let path = index_dir.join(format!("data.part{:03}{}", part, ext));
+        let path = idx.part_path(index_dir, *part);
         let exists = if path.exists() { "v" } else { "x" };
         out.println(&format!(
             "    {} part{:03}  {}",

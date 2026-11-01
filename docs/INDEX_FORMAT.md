@@ -1,170 +1,134 @@
-# Archivum - Index Format Reference
+# Archivum - Index Format Reference (v4)
 
-The `index.arc.json` file is the heart of every Archivum archive. It is a human-readable JSON file containing all metadata, checksums, and structural information needed to list, verify, restore, or search an archive.
+The `index.arc.json` file is the heart of every Archivum archive. It is plain JSON holding all metadata, checksums and the location of every file's data, so an archive can be listed, searched, verified and restored from it alone. It is readable with any editor or `jq`.
+
+Format v4 is a clean break from v1-v3. This build refuses older indexes with a clear message; restore those archives with the release that wrote them.
 
 ---
 
-## File Naming
+## Files
 
 ```
 <output>/
-├── index.arc.json        ← The index
-└── index.arc.json.b3     ← Blake3 integrity seal (hex string)
+├── index.arc.json         the index
+├── index.arc.json.b3      Blake3 seal (hex): detects corruption and accidental edits
+├── index.arc.json.sig     optional Ed25519 signature (see `archivum keygen`, `--sign`, `--pubkey`)
+├── data.part000.tar.zst   data parts
+└── data.part001.tar.zst
 ```
 
-The `.b3` file contains the Blake3 hash of `index.arc.json`. The `verify` command checks this automatically to detect any modification or tampering.
+The `.b3` hash is unkeyed, so it does not stop someone who deliberately rewrites both files. The signature does: with `--pubkey KEY` every command refuses an index that is unsigned, signed by another key, or modified after signing. Because the index holds the SHA-256 of every file, a valid signature protects all of the archive's content.
 
 ---
 
-## Schema (v3)
+## Data layout: parts and frames
+
+A **part** is a sequence of independently compressed **frames** (a zstd frame, gzip member, bzip2 stream or lz4 frame; raw bytes for `none`). A frame holds either one large file (4 MiB and up) or a batch of small files (about 1 MiB of tar). Every file in the index records the frame that holds it.
+
+Consequences:
+
+- Reading one file decompresses only its own frame (`cat`, `extract`).
+- Frames are independent, so restore and verify run in parallel, even inside one part.
+- Damage stays inside a frame: a flipped bit costs the files of that frame, not the rest of the part.
+- Small frames are compressed on a worker pool while the output order stays fixed, so the bytes do not depend on the thread count.
+- Concatenating the frames of a part gives an ordinary tar stream. `zstd -dc data.part000.tar.zst | tar tf -` works (and `gzip`, `bzip2`, `lz4` likewise), because each part ends with a frame holding the tar end-of-archive blocks.
+
+---
+
+## Schema
 
 ```json
 {
   "header": {
-    "version":          3,
-    "created_at_unix":  1740567000,
+    "version": 4,
+    "created_at_unix": 1740567000,
     "created_at_human": "2026-02-26 12:30:00 UTC",
-    "total_files":      142,
-    "total_dirs":       18,
-    "total_symlinks":   3,
-    "total_size":       52428800,
-    "total_parts":      2,
-    "compression":      "zstd",
-    "zstd_level":       9,
-    "notes":            "Pre-deploy snapshot",
-    "part_bases":       ["data"]
+    "total_files": 142,
+    "total_dirs": 18,
+    "total_symlinks": 3,
+    "total_size": 52428800,
+    "zstd_level": 9,
+    "notes": "Production backup - pre-deploy",
+    "parts": [
+      { "path": "data.part000.tar.zst", "compression": "zstd", "size": 18304211 },
+      { "path": "../2026-02-01/data.part000.tar.gz", "compression": "gzip", "size": 40211876 }
+    ]
   },
   "entries": [
     {
-      "path":           "src/main.rs",
-      "entry_type":     "file",
-      "size":           13421,
-      "mtime":          1740500000,
-      "unix_mode":      33188,
-      "sha256":         "e3b0c44298fc1c149afbf4c8996fb924...",
-      "tar_part":       0,
-      "dedup_of":       null,
-      "symlink_target": null
+      "path": "src/main.rs",
+      "entry_type": "file",
+      "size": 13421,
+      "mtime": 1740500000,
+      "unix_mode": 33188,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb924...",
+      "loc": { "part": 0, "off": 1048576, "len": 220114 }
     },
-    {
-      "path":           "assets",
-      "entry_type":     "directory",
-      "size":           0,
-      "mtime":          1740499000,
-      "unix_mode":      16877,
-      "sha256":         null,
-      "tar_part":       0,
-      "dedup_of":       null,
-      "symlink_target": null
-    },
-    {
-      "path":           "run.sh",
-      "entry_type":     "symlink",
-      "size":           0,
-      "mtime":          1740498000,
-      "unix_mode":      null,
-      "sha256":         null,
-      "tar_part":       0,
-      "dedup_of":       null,
-      "symlink_target": "scripts/run.sh"
-    },
-    {
-      "path":           "src/copy_of_main.rs",
-      "entry_type":     "file",
-      "size":           13421,
-      "mtime":          1740501000,
-      "unix_mode":      33188,
-      "sha256":         null,
-      "tar_part":       0,
-      "dedup_of":       "src/main.rs"
-    }
+    { "path": "src/copy.rs", "entry_type": "file", "size": 13421, "mtime": 1740500000,
+      "unix_mode": 33188, "sha256": "e3b0c4...", "dedup_of": "src/main.rs" },
+    { "path": "link", "entry_type": "symlink", "size": 0, "mtime": 1740500000,
+      "unix_mode": 41471, "symlink_target": "src/main.rs" },
+    { "path": "src", "entry_type": "directory", "size": 0, "mtime": 1740500000, "unix_mode": 16877 }
   ]
 }
 ```
 
----
-
-## Header Fields
+### Header
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `version` | int | Index format version (current: `3`) |
-| `created_at_unix` | int | Archive creation timestamp (Unix epoch) |
-| `created_at_human` | string | Human-readable timestamp (UTC) |
-| `total_files` | int | Count of regular files |
-| `total_dirs` | int | Count of directories |
-| `total_symlinks` | int | Count of symbolic links |
+| `version` | int | Index format version (`4`) |
+| `created_at_unix` / `created_at_human` | int / string | Creation time |
+| `total_files`, `total_dirs`, `total_symlinks` | int | Counts |
 | `total_size` | int | Sum of all file sizes in bytes |
-| `total_parts` | int | Number of tar parts |
-| `compression` | string | `none` \| `gzip` \| `zstd` \| `bzip2` \| `lz4` |
-| `zstd_level` | int | Zstd level (only meaningful when compression = `zstd`) |
-| `notes` | string | User-supplied annotation (may be empty) |
-| `part_bases` | array | Base names for tar parts (usually `["data"]`) |
+| `zstd_level` | int | Level used for new zstd frames (informational) |
+| `notes` | string | Free text |
+| `parts` | array | Every part this archive reads, see below |
 
----
+### `parts[]`
 
-## Entry Fields
+| Field | Description |
+|-------|-------------|
+| `path` | Path relative to the index file's directory. May point into another directory (`../older/data.part000.tar.zst`): incremental archives list the parts of the archives they build on |
+| `compression` | `none`, `gzip`, `bzip2`, `lz4` or `zstd`. Every part has its own, so an update can switch algorithm |
+| `size` | Compressed size in bytes, so `verify` spots a truncated part without reading it |
 
-| Field | Type | Nullable | Description |
-|-------|------|----------|-------------|
-| `path` | string | No | Relative path from archive root |
-| `entry_type` | string | No | `"file"` \| `"directory"` \| `"symlink"` |
-| `size` | int | No | File size in bytes (0 for dirs and symlinks) |
-| `mtime` | int | Yes | Last-modified timestamp (Unix epoch) |
-| `unix_mode` | int | Yes | Unix permissions as decimal (e.g. `33188` = `0o100644`) |
-| `sha256` | string | Yes | Hex SHA-256 of file content (null for dirs, symlinks, dedup entries) |
-| `tar_part` | int | No | Zero-based index of the tar part containing this file |
-| `dedup_of` | string | Yes | If set, this file is a duplicate of the named path |
-| `symlink_target` | string | Yes | Symlink target path (only for symlinks) |
+New parts of an archive come first, followed by the parts of the archive it was updated from.
 
----
+### Entries
 
-## Part File Naming
+| Field | Required | Description |
+|-------|----------|-------------|
+| `path` | yes | Relative path with `/` separators. Absolute paths and `..` are rejected on read |
+| `entry_type` | yes | `file`, `directory` or `symlink` |
+| `size` | yes | Size in bytes (0 for directories and symlinks) |
+| `mtime`, `unix_mode` | no | Restored by `restore` (mode with `--restore-permissions`) |
+| `sha256` | files | Checked while restoring, extracting and verifying |
+| `loc` | stored files | `{part, off, len}`: index into `parts`, byte offset of the frame, compressed length. `len: 0` means the frame boundaries are unknown (index rebuilt by `repair`): the whole part is decoded to find the file |
+| `dedup_of` | aliases | Path of the entry that holds the data; the alias has no `loc` |
+| `symlink_target` | symlinks | Link target |
 
-Parts are named `<base>.part<NNN>.<ext>`:
-
-| Compression | Extension |
-|-------------|-----------|
-| `none` | `.tar` |
-| `gzip` | `.tar.gz` |
-| `zstd` | `.tar.zst` |
-| `bzip2` | `.tar.bz2` |
-| `lz4` | `.tar.lz4` |
-
-Example with `base = "data"`, compression `zstd`, 3 parts:
-```
-data.part000.tar.zst
-data.part001.tar.zst
-data.part002.tar.zst
-```
+Entries are sorted by path. The same tree always produces the same index apart from `created_at_*`.
 
 ---
 
 ## Inspecting with jq
 
 ```bash
-# Count files
-jq '.header.total_files' index.arc.json
-
-# List all paths
-jq -r '.entries[].path' index.arc.json
-
-# Find large files (>10 MB)
-jq -r '.entries[] | select(.size > 10485760) | "\(.size)\t\(.path)"' index.arc.json | sort -rn
-
-# List deduplicated files
-jq -r '.entries[] | select(.dedup_of != null) | "\(.path) → dedup of \(.dedup_of)"' index.arc.json
-
-# Show header
 jq '.header' index.arc.json
+jq -r '.entries[].path' index.arc.json
+jq -r '.entries[] | select(.size > 10485760) | "\(.size)\t\(.path)"' index.arc.json | sort -rn
+jq -r '.entries[] | select(.dedup_of != null) | "\(.path) -> \(.dedup_of)"' index.arc.json
+jq '[.entries[].loc | select(. != null) | .off] | unique | length' index.arc.json   # frame count
 ```
 
 ---
 
-## Version History
+## Version history
 
 | Version | Changes |
 |---------|---------|
-| v3 | Adds `notes`, `dedup_of`, `zstd_level`, `part_bases`, Blake3 seal |
-| v2 | Adds `created_at_human`, `total_symlinks`, `total_parts`, `compression`, `sha256`, `symlink_target` |
+| v4 | Frames and per-file `loc`; per-part compression and size in `parts`; optional Ed25519 signature; paths validated on read. Replaces `tar_part`, `tar_base`, `part_bases`, `total_parts` and the single `compression` field |
+| v3 | `notes`, `dedup_of`, `zstd_level`, `part_bases`, Blake3 seal |
+| v2 | `created_at_human`, `total_symlinks`, `total_parts`, `compression`, `sha256`, `symlink_target` |
 | v1 | Basic `path`, `size`, `mtime`, `tar_part` |

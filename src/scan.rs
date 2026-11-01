@@ -43,16 +43,66 @@ pub struct ScanEntry {
     pub symlink_target: Option<PathBuf>,
 }
 
-pub fn scan_directory(root: &Path, excludes: &[String]) -> Result<Vec<ScanEntry>> {
-    let excludeset = build_globset(excludes)?;
-    let mut out = Vec::new();
+/// Result of a directory walk. Anything that could not be read ends up in
+/// `warnings` instead of disappearing silently.
+pub struct Scan {
+    pub entries: Vec<ScanEntry>,
+    pub warnings: Vec<String>,
+}
 
-    for entry in WalkDir::new(root)
+/// `skip_dirs` are absolute directories (typically the archive output dir) that must
+/// never be archived, even when they live inside `root`.
+pub fn scan_directory_with(
+    root: &Path,
+    excludes: &[String],
+    skip_dirs: &[PathBuf],
+) -> Result<Scan> {
+    let excludeset = build_globset(excludes)?;
+
+    let root_canon = root.canonicalize().ok();
+    let skip_rel: Vec<PathBuf> = skip_dirs
+        .iter()
+        .filter_map(|s| {
+            root_canon
+                .as_ref()
+                .and_then(|rc| s.strip_prefix(rc).ok())
+                .map(Path::to_path_buf)
+        })
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+
+    let mut entries = Vec::new();
+    let mut warnings = Vec::new();
+
+    // filter_entry prunes whole subtrees, so excluding `node_modules` really
+    // skips everything below it.
+    let walker = WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
-        .filter_map(|e| e.ok())
-    {
+        .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            match e.path().strip_prefix(root) {
+                Ok(rel) => !(excludeset.is_match(rel) || skip_rel.iter().any(|s| s == rel)),
+                Err(_) => true,
+            }
+        });
+
+    for item in walker {
+        let entry = match item {
+            Ok(e) => e,
+            Err(e) => {
+                let where_ = e
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "?".into());
+                warnings.push(format!("cannot read {}: {}", where_, e));
+                continue;
+            }
+        };
+
         let path = entry.path();
         let rel = path.strip_prefix(root)?.to_path_buf();
 
@@ -60,14 +110,24 @@ pub fn scan_directory(root: &Path, excludes: &[String]) -> Result<Vec<ScanEntry>
             continue;
         }
 
-        if excludeset.is_match(&rel) {
+        if rel.to_str().is_none() {
+            warnings.push(format!(
+                "skipping {}: path is not valid UTF-8 and cannot be stored in the index",
+                path.display()
+            ));
             continue;
         }
 
-        let meta = fs::symlink_metadata(path)?;
+        let meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                warnings.push(format!("cannot stat {}: {}", path.display(), e));
+                continue;
+            }
+        };
 
         #[cfg(unix)]
-        let (mtime, mode) = (Some(meta.mtime() as u64), Some(meta.mode()));
+        let (mtime, mode) = (Some(meta.mtime().max(0) as u64), Some(meta.mode()));
 
         #[cfg(not(unix))]
         let (mtime, mode) = {
@@ -81,7 +141,7 @@ pub fn scan_directory(root: &Path, excludes: &[String]) -> Result<Vec<ScanEntry>
 
         if meta.is_symlink() {
             let target = fs::read_link(path).ok();
-            out.push(ScanEntry {
+            entries.push(ScanEntry {
                 relative_path: rel,
                 entry_type: EntryType::Symlink,
                 size: 0,
@@ -90,7 +150,7 @@ pub fn scan_directory(root: &Path, excludes: &[String]) -> Result<Vec<ScanEntry>
                 symlink_target: target,
             });
         } else if meta.is_dir() {
-            out.push(ScanEntry {
+            entries.push(ScanEntry {
                 relative_path: rel,
                 entry_type: EntryType::Directory,
                 size: 0,
@@ -99,7 +159,7 @@ pub fn scan_directory(root: &Path, excludes: &[String]) -> Result<Vec<ScanEntry>
                 symlink_target: None,
             });
         } else if meta.is_file() {
-            out.push(ScanEntry {
+            entries.push(ScanEntry {
                 relative_path: rel,
                 entry_type: EntryType::File,
                 size: meta.len(),
@@ -110,13 +170,17 @@ pub fn scan_directory(root: &Path, excludes: &[String]) -> Result<Vec<ScanEntry>
         }
     }
 
-    Ok(out)
+    Ok(Scan { entries, warnings })
 }
 
+/// Patterns without a `/` apply at any depth (`.DS_Store` also matches `a/b/.DS_Store`).
 fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for p in patterns {
         builder.add(Glob::new(p)?);
+        if !p.contains('/') {
+            builder.add(Glob::new(&format!("**/{p}"))?);
+        }
     }
     Ok(builder.build()?)
 }

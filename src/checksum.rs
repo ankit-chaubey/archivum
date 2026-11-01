@@ -21,21 +21,32 @@ use hex::encode;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
 
 use crate::index::ArchivumIndex;
 use crate::scan::EntryType;
 
-pub fn compute_checksums(root: &Path, idx: &mut ArchivumIndex, num_threads: usize) -> Result<()> {
-    let total: u64 = idx
+/// Hash every regular file. Any unreadable file aborts the run: an archive with
+/// a missing checksum would silently weaken verification later.
+/// When `dedup` is set, files with identical content are marked as aliases.
+pub fn compute_checksums(
+    root: &Path,
+    idx: &mut ArchivumIndex,
+    num_threads: usize,
+    dedup: bool,
+) -> Result<()> {
+    let work: Vec<(usize, PathBuf, u64)> = idx
         .entries
         .iter()
-        .filter(|e| e.entry_type == EntryType::File && e.dedup_of.is_none())
-        .map(|e| e.size)
-        .sum();
+        .enumerate()
+        .filter(|(_, e)| e.entry_type == EntryType::File)
+        .map(|(i, e)| (i, root.join(&e.path), e.size))
+        .collect();
+
+    let total: u64 = work.iter().map(|(_, _, s)| *s).sum();
 
     let pb = ProgressBar::new(total);
     pb.set_style(
@@ -46,61 +57,61 @@ pub fn compute_checksums(root: &Path, idx: &mut ArchivumIndex, num_threads: usiz
         .progress_chars("=> "),
     );
 
-    // (index_position, abs_path, size)
-    let work: Vec<(usize, std::path::PathBuf, u64)> = idx
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.entry_type == EntryType::File && e.dedup_of.is_none())
-        .map(|(i, e)| (i, root.join(&e.path), e.size))
-        .collect();
-
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads.max(1))
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
-    let pb_arc = Arc::new(pb);
-    let results: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(Vec::new()));
-
-    pool.install(|| {
+    let results: Vec<(usize, Result<String>)> = pool.install(|| {
         work.par_iter()
-            .map(|(idx_pos, path, _size)| -> Result<(usize, String)> {
-                let hash = hash_file(path)?;
-                Ok((*idx_pos, hash))
+            .map(|(pos, path, size)| {
+                let r = hash_file(path);
+                pb.inc(*size);
+                (*pos, r)
             })
-            .for_each(|result| match result {
-                Ok((pos, hash)) => {
-                    let size = idx.entries[pos].size;
-                    results.lock().unwrap().push((pos, hash));
-                    pb_arc.inc(size);
-                }
-                Err(e) => {
-                    pb_arc.suspend(|| eprintln!("  checksum error: {}", e));
-                }
-            });
+            .collect()
     });
 
-    pb_arc.finish_with_message("checksums done".green().to_string());
+    pb.finish_with_message("checksums done".green().to_string());
 
-    let res = results.lock().unwrap();
-    for (i, hash) in res.iter() {
-        idx.entries[*i].sha256 = Some(hash.clone());
+    let mut failures = vec![];
+    for (pos, r) in results {
+        match r {
+            Ok(h) => idx.entries[pos].sha256 = Some(h),
+            Err(e) => failures.push(format!("{}: {:#}", idx.entries[pos].path.display(), e)),
+        }
+    }
+    if !failures.is_empty() {
+        let shown: Vec<_> = failures.iter().take(10).cloned().collect();
+        anyhow::bail!(
+            "{} file(s) could not be read:\n  {}{}",
+            failures.len(),
+            shown.join("\n  "),
+            if failures.len() > shown.len() {
+                "\n  ..."
+            } else {
+                ""
+            }
+        );
     }
 
-    // mark duplicate files by sha256
-    let mut seen: std::collections::HashMap<String, std::path::PathBuf> =
-        std::collections::HashMap::new();
+    for e in idx.entries.iter_mut() {
+        e.dedup_of = None;
+    }
 
-    for entry in idx.entries.iter_mut() {
-        if entry.entry_type != EntryType::File {
-            continue;
-        }
-        if let Some(ref hash) = entry.sha256.clone() {
-            if let Some(first_path) = seen.get(hash) {
-                entry.dedup_of = Some(first_path.clone());
-            } else {
-                seen.insert(hash.clone(), entry.path.clone());
+    if dedup {
+        let mut seen: HashMap<String, PathBuf> = HashMap::new();
+        for entry in idx.entries.iter_mut() {
+            if entry.entry_type != EntryType::File || entry.size == 0 {
+                continue;
+            }
+            if let Some(hash) = entry.sha256.as_ref() {
+                match seen.get(hash) {
+                    Some(first) => entry.dedup_of = Some(first.clone()),
+                    None => {
+                        seen.insert(hash.clone(), entry.path.clone());
+                    }
+                }
             }
         }
     }
@@ -110,11 +121,15 @@ pub fn compute_checksums(root: &Path, idx: &mut ArchivumIndex, num_threads: usiz
 
 // 128 KiB chunks, no temp files
 pub fn hash_file(path: &Path) -> Result<String> {
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 131072];
     let file =
         File::open(path).map_err(|e| anyhow::anyhow!("Cannot open {}: {}", path.display(), e))?;
     let mut reader = BufReader::new(file);
+    hash_reader(&mut reader)
+}
+
+pub fn hash_reader<R: Read + ?Sized>(reader: &mut R) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 131072];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
@@ -125,15 +140,33 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(encode(hasher.finalize()))
 }
 
-pub fn hash_reader<R: Read>(reader: &mut R) -> Result<String> {
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 131072];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+/// Pass-through reader that hashes and counts everything read through it.
+pub struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+    bytes: u64,
+}
+
+impl<R: Read> HashingReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            bytes: 0,
         }
-        hasher.update(&buf[..n]);
     }
-    Ok(encode(hasher.finalize()))
+
+    /// (hex sha256, bytes read)
+    pub fn finalize(self) -> (String, u64) {
+        (encode(self.hasher.finalize()), self.bytes)
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.bytes += n as u64;
+        Ok(n)
+    }
 }

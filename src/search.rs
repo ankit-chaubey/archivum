@@ -30,11 +30,11 @@ pub fn search(index_path: &Path, pattern: &str, out: &OutputCtx) -> Result<()> {
     // glob if it has metacharacters, substring otherwise
     let is_glob = pattern.contains('*') || pattern.contains('?') || pattern.contains('[');
     let globset: Option<GlobSet> = if is_glob {
-        Glob::new(pattern).ok().and_then(|g| {
-            let mut b = GlobSetBuilder::new();
-            b.add(g);
-            b.build().ok()
-        })
+        let g = Glob::new(pattern)
+            .map_err(|e| anyhow::anyhow!("Invalid glob pattern '{}': {}", pattern, e))?;
+        let mut b = GlobSetBuilder::new();
+        b.add(g);
+        Some(b.build()?)
     } else {
         None
     };
@@ -59,7 +59,7 @@ pub fn search(index_path: &Path, pattern: &str, out: &OutputCtx) -> Result<()> {
                     "path": e.path,
                     "size": e.size,
                     "sha256": e.sha256,
-                    "tar_part": e.tar_part,
+                    "loc": e.loc,
                     "mtime": e.mtime
                 })
             })
@@ -93,7 +93,9 @@ pub fn search(index_path: &Path, pattern: &str, out: &OutputCtx) -> Result<()> {
         };
         out.println(&format!(
             "  {:<8} {:<12} {}{}",
-            format!("part{:03}", e.tar_part),
+            e.loc
+                .map(|l| format!("part{:03}", l.part))
+                .unwrap_or_else(|| "-".into()),
             human(e.size),
             e.path.display(),
             dedup_tag

@@ -23,6 +23,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub defaults: DefaultsConfig,
     pub create: CreateConfig,
@@ -30,9 +31,12 @@ pub struct Config {
     pub update: UpdateConfig,
     pub output: OutputConfig,
     pub prune: PruneConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DefaultsConfig {
     /// none | gzip | bzip2 | lz4 | zstd
     pub compress: String,
@@ -42,10 +46,14 @@ pub struct DefaultsConfig {
     /// 0 = disabled, use split_gb instead
     pub split_files: usize,
     pub threads: usize,
+    /// zstd worker threads, 0 = auto (all cores)
+    #[serde(default)]
+    pub zstd_threads: u32,
     pub color: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CreateConfig {
     pub exclude: Vec<String>,
     pub dedup: bool,
@@ -53,29 +61,63 @@ pub struct CreateConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RestoreConfig {
     pub force: bool,
     pub restore_permissions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UpdateConfig {
     /// full sha256 diff vs mtime+size only
     pub checksum_diff: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OutputConfig {
     pub json: bool,
     pub quiet: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PruneConfig {
     pub keep_last: usize,
     /// 0 = disabled
     pub max_age_days: u64,
 }
+
+/// Optional index signing. Both are paths to key files made by `archivum keygen`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// secret key used to sign every archive this tool writes ("" = do not sign)
+    #[serde(default)]
+    pub sign_key: String,
+    /// public key every index must be signed with when reading ("" = no requirement)
+    #[serde(default)]
+    pub pubkey: String,
+}
+
+macro_rules! default_from_config {
+    ($($t:ident => $f:ident),* $(,)?) => {
+        $(impl Default for $t {
+            fn default() -> Self {
+                Config::default().$f
+            }
+        })*
+    };
+}
+default_from_config!(
+    DefaultsConfig => defaults,
+    CreateConfig => create,
+    RestoreConfig => restore,
+    UpdateConfig => update,
+    OutputConfig => output,
+    PruneConfig => prune,
+);
 
 impl Default for Config {
     fn default() -> Self {
@@ -86,6 +128,7 @@ impl Default for Config {
                 split_gb: 4.0,
                 split_files: 0,
                 threads: 4,
+                zstd_threads: 0,
                 color: true,
             },
             create: CreateConfig {
@@ -113,6 +156,7 @@ impl Default for Config {
                 keep_last: 3,
                 max_age_days: 30,
             },
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -129,7 +173,7 @@ impl Config {
                     Ok(cfg) => return cfg,
                     Err(e) => {
                         eprintln!(
-                            "{} Could not parse config at {}: {}",
+                            "{} Could not parse config at {}: {:#}",
                             "warning:".yellow(),
                             path.display(),
                             e
@@ -211,6 +255,14 @@ impl Config {
             cfg.defaults.threads = v.max(1);
         }
 
+        let zt_str = prompt(
+            "Zstd worker threads (0 = auto, all cores)",
+            &cfg.defaults.zstd_threads.to_string(),
+        )?;
+        if let Ok(v) = zt_str.parse::<u32>() {
+            cfg.defaults.zstd_threads = v;
+        }
+
         let dedup_str = prompt(
             "Enable deduplication by default (true/false)",
             &cfg.create.dedup.to_string(),
@@ -284,6 +336,10 @@ impl Config {
         println!(
             "    threads       = {}",
             self.defaults.threads.to_string().yellow()
+        );
+        println!(
+            "    zstd_threads  = {}  (0 = auto)",
+            self.defaults.zstd_threads.to_string().yellow()
         );
         println!(
             "    color         = {}",

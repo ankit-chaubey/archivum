@@ -35,6 +35,9 @@ split_files = 0
 # Number of threads for parallel SHA-256 checksums
 threads = 8
 
+# zstd worker threads (0 = auto, all cores); output is byte-identical for any count
+zstd_threads = 0
+
 [output]
 # Suppress all stdout output globally
 quiet = false
@@ -144,3 +147,9 @@ compress  = "none"
 split_gb  = 4.0
 threads   = 2
 ```
+
+[security]
+# Secret key (from `archivum keygen`) used to sign every index this tool writes.
+sign_key = ""
+# Public key every index must be signed with when reading ("" = no requirement).
+pubkey = ""

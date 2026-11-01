@@ -17,17 +17,21 @@
 
 use anyhow::Result;
 use colored::Colorize;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::fsutil::INDEX_NAME;
 use crate::index::ArchivumIndex;
 use crate::output::OutputCtx;
 use crate::utils::now;
 
 struct ArchiveInfo {
     dir: PathBuf,
-    _index_path: PathBuf,
+    canon: PathBuf,
     created_at: u64,
+    /// Other archive directories whose parts this archive still reads.
+    depends_on: HashSet<PathBuf>,
 }
 
 pub fn prune(base_dir: &Path, keep_last: usize, max_age_days: u64, out: &OutputCtx) -> Result<()> {
@@ -52,16 +56,25 @@ pub fn prune(base_dir: &Path, keep_last: usize, max_age_days: u64, out: &OutputC
         if !dir.is_dir() {
             continue;
         }
-        let index_path = dir.join("index.arc.json");
+        let index_path = dir.join(INDEX_NAME);
         if !index_path.exists() {
             continue;
         }
         match ArchivumIndex::read(&index_path) {
             Ok(idx) => {
+                let canon = dir.canonicalize()?;
+                let depends_on = idx
+                    .header
+                    .parts
+                    .iter()
+                    .filter_map(|p| dir.join(&p.path).parent()?.canonicalize().ok())
+                    .filter(|p| *p != canon)
+                    .collect();
                 archives.push(ArchiveInfo {
                     dir,
-                    _index_path: index_path,
+                    canon,
                     created_at: idx.header.created_at_unix,
+                    depends_on,
                 });
             }
             Err(e) => {
@@ -101,6 +114,37 @@ pub fn prune(base_dir: &Path, keep_last: usize, max_age_days: u64, out: &OutputC
 
         if too_old || max_age_days == 0 {
             to_delete.push(arch);
+        }
+    }
+
+    // An incremental archive reads parts from the archives it was built on.
+    // Never delete an archive that a surviving archive still depends on.
+    loop {
+        let delete_set: HashSet<&Path> = to_delete.iter().map(|a| a.canon.as_path()).collect();
+        let needed: HashSet<&Path> = archives
+            .iter()
+            .filter(|a| !delete_set.contains(a.canon.as_path()))
+            .flat_map(|a| a.depends_on.iter().map(|p| p.as_path()))
+            .collect();
+        let before = to_delete.len();
+        let mut protected = vec![];
+        to_delete.retain(|a| {
+            if needed.contains(a.canon.as_path()) {
+                protected.push(a.dir.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for p in protected {
+            out.println(&format!(
+                "  {} {} (newer archives still depend on its parts)",
+                "keep:".yellow().bold(),
+                p.display()
+            ));
+        }
+        if to_delete.len() == before {
+            break;
         }
     }
 
@@ -148,15 +192,19 @@ fn delete_archive(dir: &Path, out: &OutputCtx) -> Result<()> {
 
         let is_archive_file = name.starts_with("data.part")
             || name == "index.arc.json"
-            || name == "index.arc.json.b3";
+            || name == "index.arc.json.b3"
+            || name == "index.arc.json.sig"
+            || name == "index.arc.json.tmp"
+            || name == "index.arc.json.b3.tmp";
 
         if is_archive_file {
-            fs::remove_file(&path).ok();
+            fs::remove_file(&path)
+                .map_err(|e| anyhow::anyhow!("Cannot delete {}: {}", path.display(), e))?;
         }
     }
 
     if fs::read_dir(dir)?.next().is_none() {
-        fs::remove_dir(dir).ok();
+        fs::remove_dir(dir)?;
         out.println(&format!("  {} {}", "Deleted:".red().bold(), dir.display()));
     } else {
         out.println(&format!(

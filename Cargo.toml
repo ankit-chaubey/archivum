@@ -1,6 +1,6 @@
 [package]
 name         = "archivum"
-version      = "0.3.0"
+version      = "0.4.0"
 edition      = "2024"
 license      = "Apache-2.0"
 authors      = ["Ankit Chaubey <ankitchaubey.dev@gmail.com>"]
@@ -28,11 +28,13 @@ serde         = { version = "1.0", features = ["derive"] }
 serde_json    = "1.0"
 anyhow        = "1.0"
 sha2          = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core     = { version = "0.6", features = ["getrandom"] }
 hex           = "0.4"
 indicatif     = "0.17"
 colored       = "2.1"
 flate2        = "1.0"
-zstd          = "0.13"
+zstd          = { version = "0.13", features = ["zstdmt"] }
 bzip2         = "0.4"
 lz4_flex      = "0.11"
 globset       = "0.4"
@@ -54,3 +56,6 @@ strip         = true
 [profile.dev]
 opt-level = 0
 debug     = true
+
+[dev-dependencies]
+tempfile      = "3"
