@@ -42,6 +42,7 @@ impl Env {
             .env("HOME", self.p("home"))
             .env("XDG_CONFIG_HOME", self.p("home/.config"))
             .env("APPDATA", self.p("home/appdata"))
+            .env("ARCHIVUM_CONFIG", self.p("config.toml"))
             .env("NO_COLOR", "1")
             .output()
             .unwrap()
@@ -183,8 +184,16 @@ fn exclude_prunes_whole_directories_and_matches_at_any_depth() {
         "--exclude",
         ".DS_Store",
     ]);
-    let list = e.ok(&["list", "-v", s(&e.p("out/index.arc.json"))]);
+    let list = e
+        .ok(&["list", "-v", s(&e.p("out/index.arc.json"))])
+        .replace('\\', "/");
     assert!(list.contains("keep.txt") && list.contains("sub/ok.txt"));
+    // paths are stored with '/' on every platform
+    let raw = fs::read_to_string(e.p("out/index.arc.json")).unwrap();
+    assert!(
+        raw.contains("\"sub/ok.txt\""),
+        "index must use '/' separators"
+    );
     assert!(
         !list.contains("x.js"),
         "children of excluded dir leaked: {list}"
@@ -875,25 +884,20 @@ fn partial_and_example_configs_are_accepted() {
     let e = Env::new();
     let src = e.p("src");
     write(&src, "a.txt", "a");
-    let cfg_dir = e.p("home/.config/archivum");
-    fs::create_dir_all(&cfg_dir).unwrap();
+    let cfg_file = e.p("config.toml");
     for text in [
         include_str!("../config.toml.example").to_string(),
         "[defaults]\ncompress = \"gzip\"\n".to_string(),
         String::new(),
     ] {
-        fs::write(cfg_dir.join("config.toml"), &text).unwrap();
+        fs::write(&cfg_file, &text).unwrap();
         let o = e.arc(&["create", s(&src), s(&e.p("o")), "--overwrite"]);
         assert!(o.status.success());
         let err = String::from_utf8_lossy(&o.stderr);
         assert!(!err.contains("Could not parse config"), "{err}");
     }
     // the partial config really applied
-    fs::write(
-        cfg_dir.join("config.toml"),
-        "[defaults]\ncompress = \"gzip\"\n",
-    )
-    .unwrap();
+    fs::write(&cfg_file, "[defaults]\ncompress = \"gzip\"\n").unwrap();
     e.ok(&["create", s(&src), s(&e.p("o2"))]);
     assert!(e.p("o2/data.part000.tar.gz").exists());
 }

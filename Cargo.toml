@@ -4,14 +4,14 @@ version      = "0.4.0"
 edition      = "2024"
 license      = "Apache-2.0"
 authors      = ["Ankit Chaubey <ankitchaubey.dev@gmail.com>"]
-description  = "TAR archiver with SHA-256 checksums, split parts, and incremental updates."
+description  = "Split, checksummed, verifiable archives: seekable zstd/gzip/bzip2/lz4, JSON index, dedup, incremental updates, Ed25519 signing."
 repository   = "https://github.com/ankit-chaubey/Archivum"
 homepage     = "https://github.com/ankit-chaubey/Archivum"
 documentation = "https://github.com/ankit-chaubey/Archivum/tree/main/docs"
-keywords     = ["backup", "archive", "tar", "restore", "forensics"]
+keywords     = ["archive", "backup", "compression", "checksum", "zstd"]
 categories   = ["filesystem", "command-line-utilities", "compression"]
 readme       = "README.md"
-exclude      = [".github", "*.zip", "test_all.sh"]
+exclude      = [".github", "*.zip"]
 rust-version = "1.85"
 
 # Primary binary

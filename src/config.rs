@@ -162,6 +162,10 @@ impl Default for Config {
 }
 
 pub fn config_path() -> Option<PathBuf> {
+    // explicit override: useful in containers, CI and for several profiles
+    if let Some(p) = std::env::var_os("ARCHIVUM_CONFIG") {
+        return Some(PathBuf::from(p));
+    }
     dirs::config_dir().map(|d| d.join("archivum").join("config.toml"))
 }
 

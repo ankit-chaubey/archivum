@@ -533,6 +533,8 @@ pubkey   = ""        # public key every index must be signed with when reading
 
 Any key you leave out falls back to its default, so a config can be as short as one line.
 
+The file lives in the platform config directory (`~/.config/archivum/config.toml` on Linux). Set `ARCHIVUM_CONFIG=/path/to/config.toml` to use another file, for example in containers or CI.
+
 See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for full reference.
 
 ---

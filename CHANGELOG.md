@@ -56,6 +56,7 @@ incomplete data. All of those are fixed, and every fix has a regression test in
   `diff --exclude`.
 - `verify` checks that every part exists and has the recorded size.
 - `stats` shows the compression of the archive.
+- `ARCHIVUM_CONFIG` environment variable to point at another config file.
 - Integration test suite (`tests/integration.rs`).
 
 ### Fixed (data loss and silent corruption)
@@ -84,6 +85,7 @@ incomplete data. All of those are fixed, and every fix has a regression test in
 - `--exclude node_modules` prunes the whole directory, and patterns without a `/`
   (such as `.DS_Store`) match at any depth.
 - The output directory is never archived into itself.
+- Paths in the index are stored with `/` separators on every platform. Previously an index written on Windows contained backslashes, which restored as a single oddly named file on Linux and macOS.
 - `diff` honours the configured excludes, and with `--checksum` a touched but identical
   file is not reported as modified.
 - A config file that omits keys no longer fails to load (missing keys fall back to

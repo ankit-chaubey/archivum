@@ -75,6 +75,7 @@ fn default_zstd_level() -> i32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexEntry {
+    #[serde(with = "slash_path")]
     pub path: PathBuf,
     pub entry_type: EntryType,
     pub size: u64,
@@ -82,10 +83,18 @@ pub struct IndexEntry {
     pub unix_mode: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "slash_opt_path"
+    )]
     pub symlink_target: Option<PathBuf>,
     /// if set, this file is a dedup alias and not stored in any part
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "slash_opt_path"
+    )]
     pub dedup_of: Option<PathBuf>,
     /// where the data lives (regular files that are not aliases)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -502,6 +511,48 @@ impl ArchivumIndex {
     pub fn print_summary_json(&self) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(self)?);
         Ok(())
+    }
+}
+
+/// Paths are stored with `/` separators on every platform, so an index written on
+/// Windows restores correctly on Linux and the other way round.
+fn to_slash<E: serde::ser::Error>(p: &Path) -> Result<String, E> {
+    let s = p
+        .to_str()
+        .ok_or_else(|| E::custom("path is not valid UTF-8"))?;
+    Ok(if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s.to_string()
+    })
+}
+
+mod slash_path {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::{Path, PathBuf};
+
+    pub fn serialize<S: Serializer>(p: &Path, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&super::to_slash(p)?)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PathBuf, D::Error> {
+        Ok(PathBuf::from(String::deserialize(d)?))
+    }
+}
+
+mod slash_opt_path {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::PathBuf;
+
+    pub fn serialize<S: Serializer>(p: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error> {
+        match p {
+            Some(p) => s.serialize_str(&super::to_slash(p)?),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
+        Ok(Option::<String>::deserialize(d)?.map(PathBuf::from))
     }
 }
 
